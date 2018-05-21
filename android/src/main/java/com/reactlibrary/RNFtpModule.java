@@ -6,6 +6,10 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.Callback;
+import com.facebook.react.bridge.WritableArray;
+import com.facebook.react.bridge.WritableNativeArray;
+import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.WritableNativeMap;
 
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
@@ -33,6 +37,7 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
     super(reactContext);
     this.reactContext = reactContext;
     client = new FTPClient();
+    client.setConnectTimeout(4000);
   }
 
   @ReactMethod
@@ -50,7 +55,34 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
           client.connect(RNFtpModule.this.ip_address,RNFtpModule.this.port);
           client.enterLocalPassiveMode();
           client.login(username, password);
-          promise.resolve(true);
+          int status = client.getReplyCode();
+          if (status == 230) {
+            promise.resolve(true);
+          }else{
+            promise.reject(
+              String.valueOf(status)
+            );
+          }
+        } catch (Exception e) {
+          promise.reject(
+            String.valueOf(client.getReplyCode()),
+            e.getMessage()
+          );
+        }
+      }
+    }).start();
+  }
+
+  @ReactMethod
+  public void getStatus(final Promise promise) {
+    new Thread(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          WritableMap response = new WritableNativeMap();
+          response.putInt("code",client.getReplyCode());
+          response.putString("text",client.getReplyString());
+          promise.resolve(response);
         } catch (Exception e) {
           promise.reject("ERROR",e.getMessage());
         }
@@ -66,17 +98,20 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
         FTPFile[] files = new FTPFile[0];
         try {
           files = client.listFiles(path);
-          JSONObject json = new JSONObject();
-          JSONArray arrfiles = new JSONArray();
+          WritableArray arrfiles = new WritableNativeArray();
+          int key = 0;
           for (FTPFile file : files) {
-            JSONObject tmp = new JSONObject();
-            tmp.put("name",file.getName());
-            tmp.put("size",file.getSize());
-            tmp.put("timestamp",file.getTimestamp());
-            arrfiles.put(tmp);
+            key = 1 + key;
+            WritableMap tmp = new WritableNativeMap();
+            tmp.putString("key",String.valueOf(key));
+            tmp.putString("name",file.getName());
+            tmp.putString("size",String.valueOf(file.getSize()));
+            tmp.putString("timestamp",String.valueOf(file.getTimestamp().getTimeInMillis()));
+            tmp.putString("filePath",path + file.getName() + "/");
+            tmp.putBoolean("isDir",file.isDirectory());
+            arrfiles.pushMap(tmp);
           }
-          json.put("results",arrfiles);
-          promise.resolve(json.toString());
+          promise.resolve(arrfiles);
         } catch (Exception e) {
           promise.reject("ERROR", e.getMessage());
         }
