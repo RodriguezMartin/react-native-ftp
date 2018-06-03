@@ -6,6 +6,7 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.Callback;
+import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableNativeArray;
 import com.facebook.react.bridge.WritableMap;
@@ -14,17 +15,29 @@ import com.facebook.react.bridge.WritableNativeMap;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
 import org.apache.commons.net.ftp.FTPFile;
+import org.apache.commons.net.io.Util;
+import org.apache.commons.net.io.CopyStreamAdapter;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedOutputStream;
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Objects;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+
+import com.facebook.react.modules.core.DeviceEventManagerModule;
+import javax.annotation.Nullable;
+import android.text.format.Formatter;
+
 
 public class RNFtpModule extends ReactContextBaseJavaModule {
 
@@ -32,18 +45,29 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
   private static String ip_address;
   private static int port;
   private static FTPClient client;
+  private static String outputDirectoryPath;
 
   public RNFtpModule(ReactApplicationContext reactContext) {
     super(reactContext);
     this.reactContext = reactContext;
     client = new FTPClient();
     client.setConnectTimeout(4000);
+    client.setBufferSize(1024000);
   }
 
-  @ReactMethod
-  public void setup(String ip_address, int port){
+  @ReactMethod @Nullable
+  public void setup(String ip_address, int port, @Nullable String outputDirectoryPath){
     this.ip_address = ip_address;
     this.port = port;
+    if(outputDirectoryPath == null){
+      this.outputDirectoryPath = reactContext.getFilesDir().getAbsolutePath();
+    }
+    else{
+      this.outputDirectoryPath = Objects.equals(outputDirectoryPath.substring(outputDirectoryPath.length() - 1),"/")
+        ? outputDirectoryPath.substring(0, outputDirectoryPath.length() - 1)
+        : outputDirectoryPath;
+      (new File(outputDirectoryPath)).mkdirs();
+    }
   }
 
   @ReactMethod
@@ -82,6 +106,7 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
           WritableMap response = new WritableNativeMap();
           response.putInt("code",client.getReplyCode());
           response.putString("text",client.getReplyString());
+          response.putBoolean("noop",client.sendNoOp());
           promise.resolve(response);
         } catch (Exception e) {
           promise.reject("ERROR",e.getMessage());
@@ -90,23 +115,45 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
     }).start();
   }
 
+  void sortByName(ArrayList list){
+    Collections.sort(list, new Comparator<FTPFile>() {
+      @Override
+      public int compare(FTPFile file1, FTPFile file2){
+        return file1.getName().compareTo(file2.getName());
+      }
+    });
+  }
+
   @ReactMethod
   public void list(final String path, final Promise promise){
     new Thread(new Runnable() {
       @Override
       public void run() {
-        FTPFile[] files = new FTPFile[0];
+        FTPFile[] all = new FTPFile[0];
+        ArrayList<FTPFile> dirs = new ArrayList<FTPFile>();
+        ArrayList<FTPFile> files = new ArrayList<FTPFile>();
         try {
-          files = client.listFiles(path);
+          all = client.listFiles(path);
+          for (FTPFile file : all) {
+            if(file.isDirectory()){
+              dirs.add(file);
+            }
+            else{
+              files.add(file);
+            }
+          }
+          sortByName(dirs);
+          sortByName(files);
+          dirs.addAll(files);
           WritableArray arrfiles = new WritableNativeArray();
           int key = 0;
-          for (FTPFile file : files) {
+          for (FTPFile file : dirs) {
             key = 1 + key;
             WritableMap tmp = new WritableNativeMap();
             tmp.putString("key",String.valueOf(key));
             tmp.putString("name",file.getName());
+            tmp.putString("readableSize",Formatter.formatShortFileSize(reactContext, file.getSize()));
             tmp.putString("size",String.valueOf(file.getSize()));
-            tmp.putString("timestamp",String.valueOf(file.getTimestamp().getTimeInMillis()));
             tmp.putString("filePath",path + file.getName() + "/");
             tmp.putBoolean("isDir",file.isDirectory());
             arrfiles.pushMap(tmp);
@@ -148,6 +195,7 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
       }
     }).start();
   }
+
   @ReactMethod
   public void removeFile(final String path, final Promise promise){
     new Thread(new Runnable() {
@@ -178,7 +226,6 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
     }).start();
   }
 
-
   @ReactMethod
   public void logout(final Promise promise){
     new Thread(new Runnable() {
@@ -194,7 +241,6 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
       }
     }).start();
   }
-
 
   @ReactMethod
   public void uploadFile(final String path,final String remoteDestinationDir, final Promise promise){
@@ -223,32 +269,84 @@ public class RNFtpModule extends ReactContextBaseJavaModule {
     }).start();
   }
 
+  private void sendEvent(String eventName, int progress) {
+    reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(eventName, progress);
+  }
 
-  @ReactMethod
-  public void downloadFile(final String remoteFile1,final String localDestinationDir, final Promise promise){
+  @ReactMethod @Nullable
+  public void downloadFile(final String listenerName, final ReadableMap remoteFile, @Nullable final String localDestinationDir, final Promise promise){
     new Thread(new Runnable() {
+
       @Override
       public void run() {
         try {
           client.setFileType(FTP.BINARY_FILE_TYPE);
-          File remoteFile = new File(remoteFile1);
-          File downloadFile1 = new File(localDestinationDir+"/"+remoteFile.getName());
-          OutputStream outputStream1 = new BufferedOutputStream(new FileOutputStream(downloadFile1));
-          boolean success = client.retrieveFile(remoteFile1, outputStream1);
-          outputStream1.close();
-
-          if (success) {
-            promise.resolve(true);
-          }else{
-            promise.reject("FAILED",remoteFile.getName()+" is not downloaded successfully.");
+          
+          String destDir;
+          if(localDestinationDir == null){
+            destDir = outputDirectoryPath;
           }
-        } catch (IOException e) {
+          else{
+            destDir = Objects.equals(localDestinationDir.substring(0,1),"/")
+              ? localDestinationDir
+              : outputDirectoryPath +"/"+ localDestinationDir;
+            if(Objects.equals(destDir.substring(destDir.length() - 1),"/")){
+              destDir = destDir.substring(0, destDir.length() - 1);
+            }
+            (new File(destDir)).mkdirs();
+          } 
+
+          InputStream input = new BufferedInputStream(client.retrieveFileStream(remoteFile.getString("filePath")));
+          OutputStream output = new FileOutputStream(destDir+"/"+remoteFile.getString("name"));
+
+          CopyStreamAdapter adapter = new CopyStreamAdapter() {
+            int current = 0;
+            public void bytesTransferred(long totalBytesTransferred, int bytesTransferred, long streamSize) {
+              int temp = (int) Math.ceil(totalBytesTransferred  * 100 / streamSize);
+              if(temp != current){
+                current = temp;
+                sendEvent(listenerName, current);
+              }
+            }
+          };
+
+          Util.copyStream(
+            input,
+            output,
+            client.getBufferSize(),
+            Long.parseLong(remoteFile.getString("size"), 10),
+            adapter
+          );
+          input.close();
+          output.close();
+          boolean ok = client.completePendingCommand();
+          if(ok){
+            promise.resolve(true);
+          }
+          else{
+            promise.reject("FAILED","not downloaded successfully.");
+          }
+        } catch (Exception e) {
           promise.reject("ERROR",e.getMessage());
         }
       }
     }).start();
   }
 
+  @ReactMethod
+  public void abort(final Promise promise){
+    new Thread(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          client.abort();
+          promise.resolve(true);
+        } catch (IOException e) {
+          promise.reject("ERROR",e.getMessage());
+        }
+      }
+    }).start();
+  }
 
   @Override
   public String getName() {
